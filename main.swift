@@ -278,6 +278,24 @@ final class VPNController: ObservableObject {
             task.standardError = errPipe
             task.standardInput = inPipe
 
+            // Drain pipes in real time to avoid deadlocks. With --background,
+            // openconnect forks a daemon child that inherits stdout/stderr fds;
+            // those fds remain open after the parent exits, so a blocking
+            // readDataToEndOfFile() would never see EOF.
+            let bufferQueue = DispatchQueue(label: "gpclient.pipe-drain")
+            var capturedOut = Data()
+            var capturedErr = Data()
+            outPipe.fileHandleForReading.readabilityHandler = { handle in
+                let chunk = handle.availableData
+                guard !chunk.isEmpty else { return }
+                bufferQueue.sync { capturedOut.append(chunk) }
+            }
+            errPipe.fileHandleForReading.readabilityHandler = { handle in
+                let chunk = handle.availableData
+                guard !chunk.isEmpty else { return }
+                bufferQueue.sync { capturedErr.append(chunk) }
+            }
+
             do {
                 try task.run()
                 inPipe.fileHandleForWriting.write(Data(pwd.utf8))
@@ -285,9 +303,14 @@ final class VPNController: ObservableObject {
                 task.waitUntilExit()
                 DispatchQueue.main.async { self.password = "" }
 
-                let outStr = String(data: outPipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
-                let errStr = String(data: errPipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
-                let combined = outStr + errStr
+                // Brief settle time for trailing data, then stop draining.
+                Thread.sleep(forTimeInterval: 0.1)
+                outPipe.fileHandleForReading.readabilityHandler = nil
+                errPipe.fileHandleForReading.readabilityHandler = nil
+                let combined = bufferQueue.sync {
+                    (String(data: capturedOut, encoding: .utf8) ?? "") +
+                    (String(data: capturedErr, encoding: .utf8) ?? "")
+                }
 
                 if task.terminationStatus != 0 {
                     if combined.contains("a password is required") || combined.contains("sudo: a terminal") {
