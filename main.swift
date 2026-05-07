@@ -52,7 +52,6 @@ final class VPNController: ObservableObject {
     private let keychainService = "com.xelldart.gpclient"
 
     private let pidFile = "/tmp/gpclient.pid"
-    private let logFile = "/tmp/gpclient.log"
     private var monitorTimer: Timer?
 
     private func trustedPinKey() -> String { "gp.cert.\(portal)" }
@@ -254,31 +253,44 @@ final class VPNController: ObservableObject {
         let host = portal
 
         try? FileManager.default.removeItem(atPath: pidFile)
-        try? FileManager.default.removeItem(atPath: logFile)
 
         DispatchQueue.global(qos: .userInitiated).async {
-            let escPwd = self.shellEscape(pwd)
-            let escUser = self.shellEscape(user)
-            let escHost = self.shellEscape(host)
-            var certFlag = ""
+            var args = ["-n", openconnect,
+                        "--protocol=gp",
+                        "--user=\(user)",
+                        "--passwd-on-stdin",
+                        "--background",
+                        "--pid-file=\(self.pidFile)",
+                        "--syslog"]
             if let pin = self.trustedPin(), !pin.isEmpty {
-                certFlag = "--servercert \(self.shellEscape(pin)) "
+                args.append("--servercert")
+                args.append(pin)
             }
-            let shellCmd = "printf '%s' \(escPwd) | /usr/bin/sudo -n \(openconnect) --protocol=gp --user=\(escUser) --passwd-on-stdin \(certFlag)--background --pid-file=\(self.pidFile) --syslog \(escHost) > \(self.logFile) 2>&1"
+            args.append(host)
 
             let task = Process()
-            task.launchPath = "/bin/sh"
-            task.arguments = ["-c", shellCmd]
+            task.launchPath = "/usr/bin/sudo"
+            task.arguments = args
+            let outPipe = Pipe()
             let errPipe = Pipe()
+            let inPipe = Pipe()
+            task.standardOutput = outPipe
             task.standardError = errPipe
-            task.standardOutput = Pipe()
+            task.standardInput = inPipe
+
             do {
                 try task.run()
+                inPipe.fileHandleForWriting.write(Data(pwd.utf8))
+                try? inPipe.fileHandleForWriting.close()
                 task.waitUntilExit()
                 DispatchQueue.main.async { self.password = "" }
+
+                let outStr = String(data: outPipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+                let errStr = String(data: errPipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+                let combined = outStr + errStr
+
                 if task.terminationStatus != 0 {
-                    let logContent = (try? String(contentsOfFile: self.logFile, encoding: .utf8)) ?? ""
-                    if logContent.contains("a password is required") || logContent.contains("sudo: a terminal") {
+                    if combined.contains("a password is required") || combined.contains("sudo: a terminal") {
                         self.appendLog("sudo asked for a password — sudoers rule missing.")
                         DispatchQueue.main.async {
                             self.status = .error
@@ -287,8 +299,10 @@ final class VPNController: ObservableObject {
                         return
                     }
                     self.appendLog("openconnect exited with status \(task.terminationStatus)")
+                    self.handleConnectFailure(output: combined)
+                    return
                 }
-                self.waitForPidAndConfirm()
+                self.waitForPidAndConfirm(capturedOutput: combined)
             } catch {
                 self.appendLog("Failed to launch openconnect: \(error.localizedDescription)")
                 DispatchQueue.main.async {
@@ -307,7 +321,7 @@ final class VPNController: ObservableObject {
         return "\"" + s.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "\"", with: "\\\"") + "\""
     }
 
-    private func waitForPidAndConfirm() {
+    private func waitForPidAndConfirm(capturedOutput: String) {
         for _ in 0..<40 {
             if let pidStr = try? String(contentsOfFile: pidFile, encoding: .utf8),
                let pid = Int(pidStr.trimmingCharacters(in: .whitespacesAndNewlines)),
@@ -322,10 +336,12 @@ final class VPNController: ObservableObject {
             }
             Thread.sleep(forTimeInterval: 0.5)
         }
-        let logContent = (try? String(contentsOfFile: logFile, encoding: .utf8)) ?? "No log output."
-        self.appendLog("openconnect did not start. Output:\n\(logContent)")
+        self.appendLog("openconnect did not start.")
+        self.handleConnectFailure(output: capturedOutput)
+    }
 
-        if let pin = self.extractPin(from: logContent) {
+    private func handleConnectFailure(output: String) {
+        if let pin = self.extractPin(from: output) {
             self.appendLog("Server is using a self-signed/unknown certificate.")
             DispatchQueue.main.async {
                 self.pendingPin = pin
@@ -335,8 +351,7 @@ final class VPNController: ObservableObject {
             }
             return
         }
-
-        let snippet = logContent
+        let snippet = output
             .components(separatedBy: "\n")
             .filter { !$0.isEmpty }
             .suffix(2)
