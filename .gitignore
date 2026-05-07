@@ -1,0 +1,14 @@
+# Build outputs
+build/
+dist/
+*.dmg
+GlobalProtect
+GlobalProtect.app/Contents/MacOS/GlobalProtect
+
+# macOS
+.DS_Store
+
+# Editor
+.vscode/
+.idea/
+*.swp
