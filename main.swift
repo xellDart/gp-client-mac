@@ -128,6 +128,8 @@ final class VPNController: ObservableObject {
         let sudoersContent = """
         \(user) ALL=(root) NOPASSWD: \(openconnect) *
         \(user) ALL=(root) NOPASSWD: /usr/bin/pkill -F /tmp/gpclient.pid
+        \(user) ALL=(root) NOPASSWD: /usr/bin/pkill -KILL -F /tmp/gpclient.pid
+        \(user) ALL=(root) NOPASSWD: /usr/bin/pkill -TERM -F /tmp/gpclient.pid
         """
         let tmp = NSTemporaryDirectory() + "gpclient-sudoers"
         try? sudoersContent.write(toFile: tmp, atomically: true, encoding: .utf8)
@@ -416,13 +418,16 @@ final class VPNController: ObservableObject {
         appendLog("Disconnecting (pid \(pid))…")
         statusDetail = "Disconnecting…"
         DispatchQueue.global(qos: .userInitiated).async {
-            let task = Process()
-            task.launchPath = "/usr/bin/sudo"
-            task.arguments = ["-n", "/usr/bin/pkill", "-F", self.pidFile]
-            task.standardError = Pipe()
-            task.standardOutput = Pipe()
-            try? task.run()
-            task.waitUntilExit()
+            self.runPkill(signal: nil)
+            Thread.sleep(forTimeInterval: 2.0)
+            if self.processAlive(pid) {
+                self.appendLog("openconnect did not respond to SIGTERM, sending SIGKILL…")
+                self.runPkill(signal: "-KILL")
+                Thread.sleep(forTimeInterval: 1.0)
+            }
+            if self.processAlive(pid) {
+                self.appendLog("Failed to kill process \(pid).")
+            }
             DispatchQueue.main.async {
                 self.status = .disconnected
                 self.statusDetail = ""
@@ -430,6 +435,20 @@ final class VPNController: ObservableObject {
                 self.appendLog("Disconnected.")
             }
         }
+    }
+
+    private func runPkill(signal: String?) {
+        let task = Process()
+        task.launchPath = "/usr/bin/sudo"
+        if let sig = signal {
+            task.arguments = ["-n", "/usr/bin/pkill", sig, "-F", pidFile]
+        } else {
+            task.arguments = ["-n", "/usr/bin/pkill", "-F", pidFile]
+        }
+        task.standardError = Pipe()
+        task.standardOutput = Pipe()
+        try? task.run()
+        task.waitUntilExit()
     }
 }
 
