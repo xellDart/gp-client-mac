@@ -41,6 +41,7 @@ final class VPNController: ObservableObject {
     @Published var rememberPassword: Bool = UserDefaults.standard.bool(forKey: "gp.rememberPassword")
     @Published var status: ConnectionStatus = .disconnected
     @Published var statusDetail: String = ""
+    @Published var assignedIP: String = ""
     @Published var showCredentialSheet: Bool = false
     @Published var showLogSheet: Bool = false
     @Published var showTrustSheet: Bool = false
@@ -111,6 +112,27 @@ final class VPNController: ObservableObject {
                     self.setupMessage = "GlobalProtect needs a one-time setup so it can run openconnect without prompting for your password every connection.\n\nClick Set Up to install a sudoers rule (you will be asked for your Mac password once)."
                     self.showSetupSheet = true
                 }
+                return
+            }
+        } catch {
+            // ignore
+            return
+        }
+        // Older sudoers installs lack the -INT rule; without it disconnect falls
+        // back to SIGTERM and openconnect never restores the system DNS.
+        let intCheck = Process()
+        intCheck.launchPath = "/usr/bin/sudo"
+        intCheck.arguments = ["-n", "-l", "/usr/bin/pkill", "-INT", "-F", pidFile]
+        intCheck.standardOutput = Pipe()
+        intCheck.standardError = Pipe()
+        do {
+            try intCheck.run()
+            intCheck.waitUntilExit()
+            if intCheck.terminationStatus != 0 {
+                DispatchQueue.main.async {
+                    self.setupMessage = "The installed sudoers rule needs an update so GlobalProtect can shut down cleanly and restore your DNS settings on disconnect.\n\nClick Set Up to update it (you will be asked for your Mac password once)."
+                    self.showSetupSheet = true
+                }
             }
         } catch {
             // ignore
@@ -126,6 +148,7 @@ final class VPNController: ObservableObject {
         }
         let sudoersContent = """
         \(user) ALL=(root) NOPASSWD: \(openconnect) *
+        \(user) ALL=(root) NOPASSWD: /usr/bin/pkill -INT -F /tmp/gpclient.pid
         \(user) ALL=(root) NOPASSWD: /usr/bin/pkill -F /tmp/gpclient.pid
         \(user) ALL=(root) NOPASSWD: /usr/bin/pkill -KILL -F /tmp/gpclient.pid
         \(user) ALL=(root) NOPASSWD: /usr/bin/pkill -TERM -F /tmp/gpclient.pid
@@ -344,14 +367,49 @@ final class VPNController: ObservableObject {
         return "\"" + s.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "\"", with: "\\\"") + "\""
     }
 
+    /// IPv4 address assigned by the VPN: the last utun interface with a
+    /// point-to-point ("inet a --> b") address — the tunnel just brought up.
+    private func detectAssignedIP() -> String? {
+        let task = Process()
+        task.launchPath = "/sbin/ifconfig"
+        let pipe = Pipe()
+        task.standardOutput = pipe
+        task.standardError = Pipe()
+        do {
+            try task.run()
+        } catch {
+            return nil
+        }
+        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        task.waitUntilExit()
+        let out = String(data: data, encoding: .utf8) ?? ""
+        var currentInterface = ""
+        var found: String?
+        for line in out.components(separatedBy: "\n") {
+            if !line.hasPrefix("\t"), !line.hasPrefix(" "), let name = line.split(separator: ":").first {
+                currentInterface = String(name)
+            } else if currentInterface.hasPrefix("utun") {
+                let parts = line.trimmingCharacters(in: .whitespaces)
+                    .components(separatedBy: " ")
+                if parts.count >= 2, parts[0] == "inet" {
+                    found = parts[1]
+                }
+            }
+        }
+        return found
+    }
+
     private func waitForPidAndConfirm(capturedOutput: String) {
         for _ in 0..<40 {
             if let pidStr = try? String(contentsOfFile: pidFile, encoding: .utf8),
                let pid = Int(pidStr.trimmingCharacters(in: .whitespacesAndNewlines)),
                processAlive(pid) {
                 self.appendLog("openconnect running (pid \(pid))")
+                let ip = self.detectAssignedIP()
+                if let ip = ip { self.appendLog("Assigned IP: \(ip)") }
                 DispatchQueue.main.async {
                     self.status = .connected
+                    self.assignedIP = ip ?? ""
                     self.statusDetail = "Connected to \(self.portal)"
                     self.startMonitor()
                 }
@@ -428,7 +486,9 @@ final class VPNController: ObservableObject {
            processAlive(pid) {
             DispatchQueue.main.async {
                 if self.status != .connected {
+                    let ip = self.detectAssignedIP()
                     self.status = .connected
+                    self.assignedIP = ip ?? ""
                     self.statusDetail = "Connected to \(self.portal)"
                     if !silent { self.appendLog("Existing session detected (pid \(pid))") }
                     self.startMonitor()
@@ -440,6 +500,7 @@ final class VPNController: ObservableObject {
                     self.appendLog("Connection dropped.")
                     self.status = .disconnected
                     self.statusDetail = ""
+                    self.assignedIP = ""
                     self.stopMonitor()
                 }
             }
@@ -456,8 +517,19 @@ final class VPNController: ObservableObject {
         appendLog("Disconnecting (pid \(pid))…")
         statusDetail = "Disconnecting…"
         DispatchQueue.global(qos: .userInitiated).async {
-            self.runPkill(signal: nil)
-            Thread.sleep(forTimeInterval: 2.0)
+            // SIGINT: openconnect logs off and runs vpnc-script to restore DNS
+            // and routes. SIGTERM exits immediately, leaving the VPN DNS behind.
+            self.runPkill(signal: "-INT")
+            var gracefulExit = false
+            for _ in 0..<10 {
+                if !self.processAlive(pid) { gracefulExit = true; break }
+                Thread.sleep(forTimeInterval: 0.5)
+            }
+            if !gracefulExit {
+                self.appendLog("openconnect did not respond to SIGINT, sending SIGTERM…")
+                self.runPkill(signal: nil)
+                Thread.sleep(forTimeInterval: 2.0)
+            }
             if self.processAlive(pid) {
                 self.appendLog("openconnect did not respond to SIGTERM, sending SIGKILL…")
                 self.runPkill(signal: "-KILL")
@@ -465,10 +537,13 @@ final class VPNController: ObservableObject {
             }
             if self.processAlive(pid) {
                 self.appendLog("Failed to kill process \(pid).")
+            } else if !gracefulExit {
+                self.appendLog("Warning: forced shutdown — DNS settings may not have been restored.")
             }
             DispatchQueue.main.async {
                 self.status = .disconnected
                 self.statusDetail = ""
+                self.assignedIP = ""
                 self.stopMonitor()
                 self.appendLog("Disconnected.")
             }
@@ -555,6 +630,18 @@ struct ContentView: View {
                             .foregroundColor(.secondary)
                             .multilineTextAlignment(.center)
                             .padding(.horizontal, 12)
+                    }
+                    if vpn.status == .connected && !vpn.assignedIP.isEmpty {
+                        Text("IP: \(vpn.assignedIP)")
+                            .font(.system(size: 11, design: .monospaced))
+                            .foregroundColor(.secondary)
+                            .textSelection(.enabled)
+                            .padding(.vertical, 3)
+                            .padding(.horizontal, 8)
+                            .background(
+                                RoundedRectangle(cornerRadius: 4)
+                                    .fill(Color(NSColor.textBackgroundColor))
+                            )
                     }
                 }
 

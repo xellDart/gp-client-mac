@@ -57,13 +57,17 @@ Requires Xcode Command Line Tools (`xcode-select --install`).
 - The Swift app launches `openconnect` via `sudo -n` (no password prompt) thanks to a sudoers drop-in installed on first run
 - A pid file at `/tmp/gpclient.pid` tracks the daemon
 - A timer monitors the process every 3s using `ps` and updates the UI accordingly
-- Disconnect uses `pkill -F /tmp/gpclient.pid`
+- Disconnect sends `SIGINT` (`pkill -INT -F /tmp/gpclient.pid`) so openconnect runs the vpnc-script cleanup and restores the system DNS and routes; it escalates to `SIGTERM`/`SIGKILL` only if the daemon does not exit
+- While connected, the UI shows the IPv4 address assigned by the gateway (read from the `utun` tunnel interface)
 
-The sudoers rule installed by the app is restricted to two specific commands:
+The sudoers rules installed by the app are restricted to specific commands:
 
 ```
 $USER ALL=(root) NOPASSWD: /opt/homebrew/bin/openconnect *
+$USER ALL=(root) NOPASSWD: /usr/bin/pkill -INT -F /tmp/gpclient.pid
 $USER ALL=(root) NOPASSWD: /usr/bin/pkill -F /tmp/gpclient.pid
+$USER ALL=(root) NOPASSWD: /usr/bin/pkill -KILL -F /tmp/gpclient.pid
+$USER ALL=(root) NOPASSWD: /usr/bin/pkill -TERM -F /tmp/gpclient.pid
 ```
 
 To uninstall the sudoers rule:
