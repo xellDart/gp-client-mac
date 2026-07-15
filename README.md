@@ -45,7 +45,7 @@ If your VPN server uses a self-signed certificate, the app will prompt you to co
 ```sh
 git clone https://github.com/xellDart/gp-client-mac.git
 cd gp-client-mac
-make build       # compiles GlobalProtect.app into ./build/
+make build       # compiles GlobalProtect.app into ./.build/ (hidden so Spotlight doesn't index a duplicate app)
 make dmg         # creates GlobalProtect.dmg
 make install     # installs the app to /Applications
 ```

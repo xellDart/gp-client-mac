@@ -1,6 +1,8 @@
 APP_NAME := GlobalProtect
 BUNDLE_ID := com.xelldart.gpclient
-BUILD_DIR := build
+# Hidden dir: Spotlight skips dot-directories, so the built .app doesn't
+# show up as a duplicate of the installed one.
+BUILD_DIR := .build
 APP_BUNDLE := $(BUILD_DIR)/$(APP_NAME).app
 BIN := $(APP_BUNDLE)/Contents/MacOS/$(APP_NAME)
 DMG := $(BUILD_DIR)/$(APP_NAME).dmg
