@@ -68,7 +68,10 @@ $USER ALL=(root) NOPASSWD: /usr/bin/pkill -INT -F /tmp/gpclient.pid
 $USER ALL=(root) NOPASSWD: /usr/bin/pkill -F /tmp/gpclient.pid
 $USER ALL=(root) NOPASSWD: /usr/bin/pkill -KILL -F /tmp/gpclient.pid
 $USER ALL=(root) NOPASSWD: /usr/bin/pkill -TERM -F /tmp/gpclient.pid
+$USER ALL=(root) NOPASSWD: /usr/bin/true gpclient-sudoers-v2
 ```
+
+The last line is a version marker: running `sudo -n /usr/bin/true gpclient-sudoers-v2` succeeds only when the current rules are installed, which is how the app detects outdated installs and offers to update them (`sudo -l` cannot distinguish passwordless rules from admin-with-password ones).
 
 To uninstall the sudoers rule:
 ```sh

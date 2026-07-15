@@ -120,9 +120,11 @@ final class VPNController: ObservableObject {
         }
         // Older sudoers installs lack the -INT rule; without it disconnect falls
         // back to SIGTERM and openconnect never restores the system DNS.
+        // `sudo -l` is unreliable here: it reports admin-with-password rules as
+        // allowed. Executing the marker rule is the only passwordless-proof test.
         let intCheck = Process()
         intCheck.launchPath = "/usr/bin/sudo"
-        intCheck.arguments = ["-n", "-l", "/usr/bin/pkill", "-INT", "-F", pidFile]
+        intCheck.arguments = ["-n", "/usr/bin/true", "gpclient-sudoers-v2"]
         intCheck.standardOutput = Pipe()
         intCheck.standardError = Pipe()
         do {
@@ -152,6 +154,7 @@ final class VPNController: ObservableObject {
         \(user) ALL=(root) NOPASSWD: /usr/bin/pkill -F /tmp/gpclient.pid
         \(user) ALL=(root) NOPASSWD: /usr/bin/pkill -KILL -F /tmp/gpclient.pid
         \(user) ALL=(root) NOPASSWD: /usr/bin/pkill -TERM -F /tmp/gpclient.pid
+        \(user) ALL=(root) NOPASSWD: /usr/bin/true gpclient-sudoers-v2
         """
         let tmp = NSTemporaryDirectory() + "gpclient-sudoers"
         try? sudoersContent.write(toFile: tmp, atomically: true, encoding: .utf8)
@@ -519,11 +522,15 @@ final class VPNController: ObservableObject {
         DispatchQueue.global(qos: .userInitiated).async {
             // SIGINT: openconnect logs off and runs vpnc-script to restore DNS
             // and routes. SIGTERM exits immediately, leaving the VPN DNS behind.
-            self.runPkill(signal: "-INT")
+            // The logoff includes a network round-trip to the gateway, so give
+            // it up to 10s before escalating.
+            let intDelivered = self.runPkill(signal: "-INT")
             var gracefulExit = false
-            for _ in 0..<10 {
-                if !self.processAlive(pid) { gracefulExit = true; break }
-                Thread.sleep(forTimeInterval: 0.5)
+            if intDelivered {
+                for _ in 0..<20 {
+                    if !self.processAlive(pid) { gracefulExit = true; break }
+                    Thread.sleep(forTimeInterval: 0.5)
+                }
             }
             if !gracefulExit {
                 self.appendLog("openconnect did not respond to SIGINT, sending SIGTERM…")
@@ -550,7 +557,10 @@ final class VPNController: ObservableObject {
         }
     }
 
-    private func runPkill(signal: String?) {
+    /// Returns false when sudo rejected the command (missing sudoers rule),
+    /// so callers can skip the graceful-exit wait.
+    @discardableResult
+    private func runPkill(signal: String?) -> Bool {
         let task = Process()
         task.launchPath = "/usr/bin/sudo"
         if let sig = signal {
@@ -558,10 +568,21 @@ final class VPNController: ObservableObject {
         } else {
             task.arguments = ["-n", "/usr/bin/pkill", "-F", pidFile]
         }
-        task.standardError = Pipe()
+        let errPipe = Pipe()
+        task.standardError = errPipe
         task.standardOutput = Pipe()
-        try? task.run()
+        do {
+            try task.run()
+        } catch {
+            return false
+        }
         task.waitUntilExit()
+        let err = String(data: errPipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+        if err.contains("password is required") || err.contains("sudo:") {
+            appendLog("sudo rejected pkill \(signal ?? "") — sudoers rule missing, run Set Up again.")
+            return false
+        }
+        return task.terminationStatus == 0
     }
 }
 
