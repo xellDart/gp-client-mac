@@ -53,6 +53,7 @@ final class VPNController: ObservableObject {
     private let keychainService = "com.xelldart.gpclient"
 
     private let pidFile = "/tmp/gpclient.pid"
+    private let dnsCleanupTool = "/usr/local/libexec/gpclient-dns-cleanup"
     private var monitorTimer: Timer?
 
     private func trustedPinKey() -> String { "gp.cert.\(portal)" }
@@ -85,7 +86,45 @@ final class VPNController: ObservableObject {
         }
         checkExistingConnection()
         DispatchQueue.global().asyncAfter(deadline: .now() + 0.3) { [weak self] in
-            self?.runSetupCheck()
+            guard let self = self else { return }
+            self.runSetupCheck()
+            // A previous session may have died (crash, lost network) without
+            // running the vpnc-script cleanup, leaving the VPN DNS behind.
+            if self.status != .connected { self.restoreDNSIfNeeded() }
+        }
+    }
+
+    /// Removes DNS/IPv4 state left by vpnc-script when a tunnel died without
+    /// running its disconnect cleanup (crash, network loss, forced kill).
+    func restoreDNSIfNeeded() {
+        guard FileManager.default.fileExists(atPath: dnsCleanupTool) else { return }
+        let task = Process()
+        task.launchPath = "/usr/bin/sudo"
+        var args = ["-n", dnsCleanupTool]
+        // Pass the portal so the helper can drop a stale host route to it;
+        // only IPv4 literals are accepted (the helper re-validates).
+        if portal.range(of: #"^\d{1,3}(\.\d{1,3}){3}$"#, options: .regularExpression) != nil {
+            args.append(portal)
+        }
+        task.arguments = args
+        let outPipe = Pipe()
+        let errPipe = Pipe()
+        task.standardOutput = outPipe
+        task.standardError = errPipe
+        do {
+            try task.run()
+        } catch {
+            return
+        }
+        task.waitUntilExit()
+        let out = String(data: outPipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+        let err = String(data: errPipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+        if out.contains("cleaned:") {
+            let devs = out.replacingOccurrences(of: "cleaned:", with: "")
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            appendLog("Restored DNS configuration (stale \(devs)).")
+        } else if err.contains("password is required") {
+            appendLog("DNS cleanup needs the updated sudoers rules — run Set Up again.")
         }
     }
 
@@ -124,7 +163,7 @@ final class VPNController: ObservableObject {
         // allowed. Executing the marker rule is the only passwordless-proof test.
         let intCheck = Process()
         intCheck.launchPath = "/usr/bin/sudo"
-        intCheck.arguments = ["-n", "/usr/bin/true", "gpclient-sudoers-v2"]
+        intCheck.arguments = ["-n", "/usr/bin/true", "gpclient-sudoers-v3"]
         intCheck.standardOutput = Pipe()
         intCheck.standardError = Pipe()
         do {
@@ -154,11 +193,44 @@ final class VPNController: ObservableObject {
         \(user) ALL=(root) NOPASSWD: /usr/bin/pkill -F /tmp/gpclient.pid
         \(user) ALL=(root) NOPASSWD: /usr/bin/pkill -KILL -F /tmp/gpclient.pid
         \(user) ALL=(root) NOPASSWD: /usr/bin/pkill -TERM -F /tmp/gpclient.pid
-        \(user) ALL=(root) NOPASSWD: /usr/bin/true gpclient-sudoers-v2
+        \(user) ALL=(root) NOPASSWD: \(dnsCleanupTool)
+        \(user) ALL=(root) NOPASSWD: /usr/bin/true gpclient-sudoers-v3
+        """
+        let cleanupScript = """
+        #!/bin/sh
+        # Remove DNS/IPv4 state left behind by openconnect's vpnc-script when
+        # the tunnel died without running its disconnect cleanup. Only touches
+        # services whose utun interface no longer exists.
+        cleaned=""
+        for dev in $(echo "list State:/Network/Service/utun[0-9]*/DNS" | /usr/sbin/scutil | /usr/bin/sed -n 's|.*State:/Network/Service/\\(utun[0-9]*\\)/DNS.*|\\1|p'); do
+            if ! /sbin/ifconfig "$dev" >/dev/null 2>&1; then
+                printf 'open\\nremove State:/Network/Service/%s/DNS\\nremove State:/Network/Service/%s/IPv4\\nclose\\n' "$dev" "$dev" | /usr/sbin/scutil >/dev/null
+                cleaned="$cleaned $dev"
+            fi
+        done
+        # A stale static host route to the VPN portal (added while on a
+        # previous network) blocks reconnection with "Can't assign requested
+        # address". Accepts the portal as an IPv4-literal argument.
+        if [ -n "$1" ]; then
+            case "$1" in
+                *[!0-9.]*) : ;;
+                *)
+                    if /usr/sbin/netstat -rn -f inet | /usr/bin/awk '{print $1}' | /usr/bin/grep -qx "$1"; then
+                        if /sbin/route -n delete -host "$1" >/dev/null 2>&1; then
+                            cleaned="$cleaned route:$1"
+                        fi
+                    fi
+                    ;;
+            esac
+        fi
+        [ -n "$cleaned" ] && echo "cleaned:$cleaned"
+        exit 0
         """
         let tmp = NSTemporaryDirectory() + "gpclient-sudoers"
         try? sudoersContent.write(toFile: tmp, atomically: true, encoding: .utf8)
-        let shellCmd = "/usr/sbin/visudo -cf '\(tmp)' && /bin/cp '\(tmp)' /etc/sudoers.d/gpclient && /bin/chmod 440 /etc/sudoers.d/gpclient && /usr/sbin/chown root:wheel /etc/sudoers.d/gpclient && /bin/rm '\(tmp)'"
+        let tmpScript = NSTemporaryDirectory() + "gpclient-dns-cleanup"
+        try? cleanupScript.write(toFile: tmpScript, atomically: true, encoding: .utf8)
+        let shellCmd = "/usr/sbin/visudo -cf '\(tmp)' && /bin/mkdir -p /usr/local/libexec && /bin/cp '\(tmpScript)' \(dnsCleanupTool) && /bin/chmod 755 \(dnsCleanupTool) && /usr/sbin/chown root:wheel \(dnsCleanupTool) && /bin/cp '\(tmp)' /etc/sudoers.d/gpclient && /bin/chmod 440 /etc/sudoers.d/gpclient && /usr/sbin/chown root:wheel /etc/sudoers.d/gpclient && /bin/rm '\(tmp)' '\(tmpScript)'"
         let appleScript = "do shell script \(appleScriptString(shellCmd)) with administrator privileges"
         DispatchQueue.global(qos: .userInitiated).async {
             let task = Process()
@@ -281,6 +353,10 @@ final class VPNController: ObservableObject {
         try? FileManager.default.removeItem(atPath: pidFile)
 
         DispatchQueue.global(qos: .userInitiated).async {
+            // Clear any stale DNS/route state from a dead tunnel before
+            // connecting — a leftover host route to the portal from another
+            // network makes the TCP connect fail outright.
+            self.restoreDNSIfNeeded()
             var args = ["-n", openconnect,
                         "--protocol=gp",
                         "--user=\(user)",
@@ -505,6 +581,10 @@ final class VPNController: ObservableObject {
                     self.statusDetail = ""
                     self.assignedIP = ""
                     self.stopMonitor()
+                    // openconnect died without cleanup; drop its stale DNS.
+                    DispatchQueue.global(qos: .utility).async {
+                        self.restoreDNSIfNeeded()
+                    }
                 }
             }
         }
@@ -545,7 +625,8 @@ final class VPNController: ObservableObject {
             if self.processAlive(pid) {
                 self.appendLog("Failed to kill process \(pid).")
             } else if !gracefulExit {
-                self.appendLog("Warning: forced shutdown — DNS settings may not have been restored.")
+                self.appendLog("Forced shutdown — cleaning up leftover DNS state…")
+                self.restoreDNSIfNeeded()
             }
             DispatchQueue.main.async {
                 self.status = .disconnected
